@@ -163,7 +163,11 @@ static void *insert_thread(void *arg)
 		st = cuckoo_insert(table, &values[i]);
 #endif
 
+#ifdef OPENHASH
 		if (st > 0) {
+#else
+		if (st == ok) {
+#endif
 			th->num_written ++;
 			total_inserted++;
 		} else {
