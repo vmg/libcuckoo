@@ -6,8 +6,6 @@
 
 #define mutex_unlock(mutex) pthread_mutex_unlock(mutex)
 
-#define keycmp(p1, p2) (memcmp(p1, p2, sizeof(KeyType)) == 0)
-
 #define ANSI_COLOR_RED     "\x1b[31m"
 #define ANSI_COLOR_GREEN   "\x1b[32m"
 #define ANSI_COLOR_YELLOW  "\x1b[33m"

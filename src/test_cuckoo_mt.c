@@ -1,53 +1,57 @@
-/* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
-/**
- * @file   test_cuckoo.c
- * @author Bin Fan <binfan@cs.cmu.edu>
- * @date   Thu Feb 28 15:54:47 2013
- * 
- * @brief  a simple example of using cuckoo hash table with multiple threads
- * 
- * 
- */
-
-#ifdef HAVE_CONFIG_H
-#  include "config.h"
-#endif
-
 #include <assert.h>
+#include <getopt.h>
 #include <stdio.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
 #include <pthread.h>
+#include <time.h>
 #include <math.h>
 #include <unistd.h>           /* for sleep */
 #include <sys/time.h>        /* for gettimeofday */
-#ifdef HAVE_GETOPT_H
-#  include <getopt.h>
-#endif
 
 #include "cuckoohash.h"
+#include "hash_open_prot.h"
 
 #define million 1000000
-#define VALUE(key) (3*key-15)
 
 /* TODO(awreece) Get this from automake. */
 #define CACHE_LINE_SIZE 64
 
+#ifdef OPENHASH
+
+oh_size_t hash_key(const char *key)
+{
+    return CityHash32(key, strlen(key));
+}
+
+int cmp_key(const char *a, const char *b)
+{
+	return strcmp(a, b) == 0;
+}
+
+DEFINE_OPENHASH(kv, const char*, void*, 1, hash_key, cmp_key);
+
+static openhash_t(kv) *table;
+pthread_rwlock_t lock;
+
+#else
+
 static cuckoo_hashtable_t* table = NULL;
-static size_t power = 25;
-static size_t total =  30 * million;
-static size_t total_inserted;
-static volatile bool keep_reading = true;
-static volatile bool keep_writing = true;
-static bool passed  = true;
+
+#endif
+
+static size_t power = 22;
+static size_t total =  5 * million;
+static volatile size_t total_inserted;
 
 typedef struct {
-    size_t num_read;
-    size_t num_written;
-    size_t ops;
-    size_t failures;
+    volatile size_t num_read;
+    volatile size_t num_written;
+    volatile size_t ops;
+    volatile size_t failures;
+    volatile size_t misses;
     int id;
 } thread_arg_t;
 
@@ -56,100 +60,90 @@ typedef union {
   char padding[CACHE_LINE_SIZE];
 } __attribute__((aligned (CACHE_LINE_SIZE))) padded_thread_arg_t;
 
-static size_t task_next;
-static size_t task_done;
-static size_t task_size = 1 * million;
-static size_t task_num;
-pthread_mutex_t task_mutex;
-bool* task_complete_flag;
+static size_t value_count;
+static cuckoo_header *values;
 
-static void task_init(size_t total) {
-    pthread_mutex_init(&task_mutex, NULL);
-    task_num = total / task_size;
-    task_complete_flag = calloc(sizeof(bool), task_num);
-    memset(task_complete_flag, false, task_num);
-    task_next = 0;
-    task_done = 0;
+static void random_key(char *key, size_t len)
+{
+	static const char alphanum[] =
+        "0123456789"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz";
+
+	size_t i;
+
+	for (i = 0; i < len; ++i) {
+		key[i] = alphanum[rand() % (sizeof(alphanum) - 1)];
+	}
+
+	key[i] = 0;
 }
 
-static size_t task_assign() {
-    size_t ret;
-    pthread_mutex_lock(&task_mutex);
-    ret = task_next;
-    task_next ++;
-    pthread_mutex_unlock(&task_mutex);
-    return ret;
+static void task_init(size_t total)
+{
+	size_t i;
+
+	values = malloc(total * sizeof(cuckoo_header));
+	value_count = total;
+
+	for (i = 0; i < total; ++i) {
+		size_t len = 16 + rand() % 32;
+		values[i].key = malloc(len + 1);
+		random_key(values[i].key, len);
+	}
 }
 
-
-static void task_complete(size_t task) {
-    size_t i;
-
-    pthread_mutex_lock(&task_mutex);
-
-    task_complete_flag[task] = true;
-
-    for (i = task_done; i < task_num; i++) {
-        if (task_complete_flag[i]) {
-            task_done = i;
-        }
-        else
-            break;
-    }
-    total_inserted = task_done * task_size;
-
-    if (i >= task_num) {
-        keep_reading = false;
-        keep_writing = false;
-    }
-
-    pthread_mutex_unlock(&task_mutex);
-}
-
-static void *lookup_thread(void *arg) {
-    cuckoo_status st;
-    KeyType key;
-    ValType val;
-
+static void *lookup_thread(void *arg)
+{
     thread_arg_t* th = (thread_arg_t*) arg;
     th->ops         = 0;
     th->failures    = 0;
     th->num_read    = 0;
     th->num_written = 0;
+	th->misses = 0;
     
-    while (keep_reading) {
-        if (total_inserted == 0) {
+    while (1) {
+		void *result = NULL;
+        size_t i;
+
+		if (!total_inserted)
+			continue;
+		
+		i = rand() % total_inserted;
+        th->ops++;
+
+#ifdef OPENHASH
+		pthread_rwlock_rdlock(&lock);
+		oh_iter_t it = openhash_get(kv, table, values[i].key);
+		if (it < openhash_end(table))
+			result = openhash_value(table, it);
+		pthread_rwlock_unlock(&lock);
+#else
+        result = cuckoo_find(table, values[i].key);
+#endif
+        
+        if (result == NULL) {
+            th->misses++;
             continue;
         }
 
-        size_t i = (int) (((float )rand() / RAND_MAX) * total_inserted);
-        if (i == 0)
-            i = 1;
-        assert(i <= total_inserted);
-        th->ops ++;
-        key = (KeyType) i;
-        st = cuckoo_find(table, (const char*) &key, (char*) &val);
-        
-        if (st != ok) {
-            printf("[reader%d] reading key %zu from table fails\n", th->id, i);
+        if (result != &values[i]) {
+            printf(
+				"[reader%d] wrong value for key %zu from table\n", th->id, i);
             th->failures ++;
             continue;
         }
-        if (val != VALUE(key)) {
-            printf("[reader%d] wrong value for key %zu from table\n", th->id, i);
-            th->failures ++;
-            continue;
-        }
-        th->num_read ++;
+
+        th->num_read++;
     }
     
     pthread_exit(NULL);
 }
 
-static void *insert_thread(void *arg) {
-    cuckoo_status st;
-    KeyType key;
-    ValType val;
+static void *insert_thread(void *arg)
+{
+    int st;
+	size_t i;
 
     thread_arg_t* th = (thread_arg_t*) arg;
     th->ops         = 0;
@@ -157,29 +151,29 @@ static void *insert_thread(void *arg) {
     th->num_read    = 0;
     th->num_written = 0;
     
-    while (keep_writing) {
-        size_t i, task;
-        task = task_assign();
-        if (task >= task_num)
-            break;
-        for (i = task * task_size + 1; i <= (task + 1) * task_size; i ++) {
-            th->ops ++;
-            key = (KeyType) i;
-            val = (ValType) VALUE(i);
-            st = cuckoo_insert(table, (const char*) &key, (const char*) &val);
+	for (i = 0; i < value_count; ++i) {
+		th->ops ++;
 
-            if (st == ok) {
-                th->num_written ++;
+#ifdef OPENHASH
+		pthread_rwlock_wrlock(&lock);
+		oh_iter_t it = openhash_set(kv, table, values[i].key, &st);
+		openhash_value(table, it) = &values[i];
+		pthread_rwlock_unlock(&lock);
+#else
+		st = cuckoo_insert(table, &values[i]);
+#endif
 
-            }
-            else {
-                printf("[writer%d] unknown error for key %zu (%d)\n", th->id, i, st);
-                th->failures ++;
-            }
-        }
-        task_complete(task);        
+		if (st > 0) {
+			th->num_written ++;
+			total_inserted++;
+		} else {
+			printf(
+			"[writer%d] unknown error for key %zu (%d)\n", th->id, i, st);
+			th->failures ++;
+		}
     }
 
+	printf("[writer%d] finished writing keys\n", th->id);
     pthread_exit(NULL);
 }
 
@@ -211,12 +205,18 @@ int main(int argc, char** argv)
         }   
     }  
 
-
+    printf("initializing keys\n");
     task_init(total);
 
     printf("initializing hash table\n");
+
+#ifdef OPENHASH
+	table = openhash_init(kv);
+	pthread_rwlock_init(&lock, NULL);
+#else
     table = cuckoo_init(power);
     cuckoo_report(table);
+#endif
 
     pthread_t* readers = calloc(sizeof(pthread_t), num_readers);
     pthread_t* writers = calloc(sizeof(pthread_t), num_writers);
@@ -261,7 +261,7 @@ int main(int argc, char** argv)
     size_t* last_num_written = calloc(sizeof(size_t), num_writers);
     memset(last_num_read, 0, num_readers);
     memset(last_num_written, 0, num_writers);
-    while (keep_reading && keep_writing) {
+    while (1) {
         sleep(1);
         gettimeofday(&tve, NULL); 
         tvsd = (double)tvs.tv_sec + (double)tvs.tv_usec/1000000;
@@ -273,29 +273,10 @@ int main(int argc, char** argv)
             last_num_read[i] = reader_args[i].arg.num_read;
         }
         for (i = 0; i < num_writers; i ++) {
-            printf("writer%d %4.2f ", i, (writer_args[i].arg.num_written - last_num_written[i])/ tdiff/ million );
+            printf("writer%d %4.2f (%zu)", i, (writer_args[i].arg.num_written - last_num_written[i])/ tdiff/ million, writer_args[i].arg.num_written );
             last_num_written[i] = writer_args[i].arg.num_written;
         }
         printf("\n");
         tvs = tve;
     }
-
-    for (i = 0; i < num_readers; i ++) {
-        pthread_join(readers[i], NULL);
-        printf("[reader%d] %zu lookups, %zu failures\n", i, reader_args[i].arg.ops, reader_args[i].arg.failures);
-        if (reader_args[i].arg.failures > 0)
-            passed = false;
-    }
-
-    for (i = 0; i < num_writers; i ++) {
-        pthread_join(writers[i], NULL);
-        printf("[writer%d] %zu inserts, %zu failures\n", i, writer_args[i].arg.ops, writer_args[i].arg.failures);
-        if (writer_args[i].arg.failures > 0)
-            passed = false;
-    }
-
-
-    cuckoo_exit(table);
-
-    printf("[%s]\n", passed ? "PASSED" : "FAILED");
 }

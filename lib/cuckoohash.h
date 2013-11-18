@@ -33,6 +33,10 @@ typedef enum {
     failure_table_full = 6,
 } cuckoo_status;
 
+typedef struct {
+	char *key;
+} cuckoo_header;
+
 
 /*
  * the structure of a buckoo hash table
@@ -85,7 +89,7 @@ cuckoo_hashtable_t* cuckoo_init(const int hashpower_init);
  * @brief Cleanup routine
  * 
  */
-cuckoo_status cuckoo_exit(cuckoo_hashtable_t* h);
+cuckoo_status cuckoo_exit(cuckoo_hashtable_t *h);
 
 
 /** 
@@ -98,7 +102,7 @@ cuckoo_status cuckoo_exit(cuckoo_hashtable_t* h);
  * 
  * @return ok if key is found, not_found otherwise
  */
-cuckoo_status cuckoo_find(cuckoo_hashtable_t* h, const char *key, char *val);
+void *cuckoo_find(cuckoo_hashtable_t* h, const char *key);
 
 
 
@@ -115,8 +119,7 @@ cuckoo_status cuckoo_find(cuckoo_hashtable_t* h, const char *key, char *val);
  * 
  * @return ok if key/value are succesfully inserted
  */
-cuckoo_status cuckoo_insert(cuckoo_hashtable_t* h, const char *key, const char* val);
-
+cuckoo_status cuckoo_insert(cuckoo_hashtable_t *h, void *val);
 
 /** 
  * @brief Delete key/value from cuckoo hash table
